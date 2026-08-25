@@ -645,28 +645,29 @@ def calc_anomalies_features_removeonlylineartrend(ds):
 
 # Calculate anomalies by removing quadratic trend and seasonal cycle
 def calc_anomalies_features_removequadratictrend(ds):
+    '''
+    Remove quadratic trend, seasonal cycle (annual and semiannual harmonics), and mean.
+    Seasonal cycle removed using same harmonic approach as linear detrending function.
+    '''
     sst = ds
     dyr = ds.time.dt.year + ds.time.dt.month/12
-    
-    # Remove quadratic trend using polyfit - apply across lat/lon dimensions
     time_numeric = dyr - dyr.mean()  # Center for better numerical stability
-    
-    # Fit quadratic polynomial across spatial dimensions
+
+
+    # --- Step 1: Remove quadratic trend ---
     def fit_quadratic_trend(time_vals, data_vals):
-        # Only fit if we have enough non-NaN data points
         if np.isnan(data_vals).all():
             return np.full_like(time_vals, np.nan)
-        # Remove any NaN values for fitting
         mask = ~np.isnan(data_vals)
-        if np.sum(mask) < 3:  # Need at least 3 points for quadratic fit
+        if np.sum(mask) < 3:
             return np.full_like(time_vals, np.nan)
         try:
             coeffs = np.polyfit(time_vals[mask], data_vals[mask], 2)
             return np.polyval(coeffs, time_vals)
         except:
             return np.full_like(time_vals, np.nan)
-    
-    # Apply the quadratic fit across all lat/lon points
+
+
     quadratic_trend = xr.apply_ufunc(
         fit_quadratic_trend,
         time_numeric, sst,
@@ -676,25 +677,60 @@ def calc_anomalies_features_removequadratictrend(ds):
         dask='parallelized',
         output_dtypes=[sst.dtype]
     )
-    
-    # Remove quadratic trend
+
+
     sst_detrended = sst - quadratic_trend
-    
-    # Remove seasonal cycle (calculate and subtract monthly climatology)
-    monthly_clim = sst_detrended.groupby('time.month').mean('time')
-    seasonal_cycle = monthly_clim.sel(month=sst.time.dt.month)
-    ssta = sst_detrended - seasonal_cycle
-    
-    # Use the 90th percentile as a threshold and find anomalies that exceed it
+
+
+    # --- Step 2: Remove seasonal cycle using annual and semiannual harmonics ---
+    # Same 4-coefficient harmonic model as linear detrending (no mean or trend terms)
+    harmonics = np.array(
+        [np.sin(2 * np.pi * dyr)] +
+        [np.cos(2 * np.pi * dyr)] +
+        [np.sin(4 * np.pi * dyr)] +
+        [np.cos(4 * np.pi * dyr)]
+    )
+
+
+    pharmonics = np.linalg.pinv(harmonics)
+
+
+    harmonics_da = xr.DataArray(
+        harmonics.T,
+        dims=['time', 'coeff'],
+        coords={'time': sst.time.values, 'coeff': np.arange(1, 5, 1)}
+    )
+    pharmonics_da = xr.DataArray(
+        pharmonics.T,
+        dims=['coeff', 'time'],
+        coords={'coeff': np.arange(1, 5, 1), 'time': sst.time.values}
+    )
+
+
+    # Fit harmonics to detrended SST
+    sst_mod = xr.DataArray(
+        pharmonics_da.dot(sst_detrended),
+        dims=['coeff', 'lat', 'lon'],
+        coords={'coeff': np.arange(1, 5, 1), 'lat': sst.lat.values, 'lon': sst.lon.values}
+    )
+
+
+    # Reconstruct and remove seasonal cycle
+    seas = harmonics_da.dot(sst_mod)
+    ssta = sst_detrended - seas
+
+
+    # --- Step 3: Threshold and detect features ---
     if ssta.chunks:
         ssta = ssta.chunk({'time': -1})
-    
+
+
     threshold = ssta.quantile(.9, dim=('time'))
     features = ssta.where(ssta >= threshold, other=np.nan)
-    
-    return  features, ssta
 
-##############
+
+    return features, ssta
+
 def access_ds(
     DIRECTORY,
     ens_memb_index, 
